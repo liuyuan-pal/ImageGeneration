@@ -220,13 +220,13 @@ def train_MNIST_VAE(hidden_nums,latent_num,batch_size,prefix,learning_rate,step_
 
         batch_num+=1
 
-def reconstruct_x(X,hidden_num,latent_num,batch_size,prefix):
+def reconstruct_x(X,hidden_num,latent_num,batch_size,prefix,epoch_num):
     input_dims=28*28
     encoder_params,decoder_params=initialize_param(input_dims,hidden_num,latent_num)
     saver = tf.train.Saver()
 
     with tf.Session() as sess:
-        saver.restore(sess, "./model/"+prefix+".ckpt-2")
+        saver.restore(sess, "./model/"+prefix+".ckpt-{}".format(epoch_num))
 
         x = tf.placeholder(tf.float32, [None, input_dims])
         e = tf.placeholder(tf.float32, [None, latent_num])
@@ -249,6 +249,29 @@ def reconstruct_x(X,hidden_num,latent_num,batch_size,prefix):
             # plt.('{}.png'.format(i))
             plt.show()
 
+def sample_new_x(sample_num,hidden_num,latent_num,batch_size,prefix,epoch_num):
+    input_dims=28*28
+    encoder_params,decoder_params=initialize_param(input_dims,hidden_num,latent_num)
+    saver = tf.train.Saver()
+
+    with tf.Session() as sess:
+        saver.restore(sess, "./model/"+prefix+".ckpt-{}".format(epoch_num))
+
+        z = tf.placeholder(tf.float32, [None, latent_num])
+        p = decoder(z,decoder_params)
+
+        prob_x=sess.run(p,{z:np.random.normal(0,1,[sample_num,latent_num])})
+
+        for i in range(sample_num):
+            import cv2
+            img=np.asarray(prob_x[i, :])
+            img=img*255
+            img=img.astype(np.uint8)
+            img=img.reshape([28,28])
+            cv2.imwrite('result/VAE_MNIST/{}.jpg'.format(i),img)
+
+    return prob_x
+
 if __name__=='__main__':
     train_MNIST_VAE([750,500,250],30,100,'VAE_MNIST',1e-3,100)
 
@@ -266,3 +289,4 @@ if __name__=='__main__':
     # input_dims=28**2
     #
     # reconstruct_x(X[:30,:],[750,500,250],30,30,'VAE_MNIST')
+    # sample_new_x(1000,[750,500,250],30,30,'VAE_MNIST',101)
