@@ -4,6 +4,19 @@ import math
 from tensorflow.examples.tutorials.mnist import input_data
 import cv2
 
+def variable_summaries(var,name):
+  """Attach a lot of summaries to a Tensor (for TensorBoard visualization)."""
+  with tf.name_scope(name):
+    mean = tf.reduce_mean(var)
+    tf.summary.scalar('mean', mean)
+    with tf.name_scope('stddev'):
+      stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
+    tf.summary.scalar('stddev', stddev)
+    tf.summary.scalar('max', tf.reduce_max(var))
+    tf.summary.scalar('min', tf.reduce_min(var))
+    tf.summary.histogram('histogram', var)
+
+
 def lrelu(x, leak=0.3, name="lrelu"):
     with tf.variable_scope(name):
         f1 = 0.5 * (1 + leak)
@@ -349,7 +362,7 @@ def build_train_MSR_face_graph_multi_gpu(
     batch_size=64,
     num_gpus=4,
     latent_dims=1024,
-    lr_g=5e-5,
+    lr_g=1e-4,
     lr_c=5e-5,
     clamp_lower=-0.01,
     clamp_upper=0.01
@@ -358,7 +371,7 @@ def build_train_MSR_face_graph_multi_gpu(
     with tf.device('/cpu:0'):
         opt_g = tf.train.RMSPropOptimizer(lr_g)
         opt_c = tf.train.RMSPropOptimizer(lr_c)
-        real_img , _ = get_msr_train_faces(batch_size)
+        real_img , _ = get_msr_train_faces(batch_size,'data/msr_train_happy.tfrecords')
         batch_queue = tf.contrib.slim.prefetch_queue.prefetch_queue([real_img], capacity=2 * num_gpus)
 
         tower_grads_c = []
@@ -366,15 +379,19 @@ def build_train_MSR_face_graph_multi_gpu(
         tower_c_losses = []
         with tf.variable_scope(tf.get_variable_scope()):
             for i in range(num_gpus):
+                image_batch = batch_queue.dequeue()
                 with tf.device('/gpu:%d' % i):
                     with tf.name_scope('%s_%d' % ('tower', i)):
-                        image_batch = batch_queue.dequeue()
                         z=tf.random_normal([batch_size,latent_dims])
 
                         with tf.variable_scope('generator'):
                             generate_img = generator(z, [4, 4, 128], [64, 64, 3], tf.tanh,
                                                      L.xavier_initializer(uniform=False))
-                        fake_logit = critic(generate_img, 32, 4, L.xavier_initializer(uniform=False))
+                            tf.get_variable_scope().reuse_variables()
+
+
+                        fake_logit = critic(generate_img, 32, 4, L.xavier_initializer(uniform=False),
+                                            (True if i>=1 else False))
                         true_logit = critic(image_batch, 32, 4, L.xavier_initializer(uniform=False), True)
 
                         tf.get_variable_scope().reuse_variables()
@@ -395,14 +412,23 @@ def build_train_MSR_face_graph_multi_gpu(
 
         total_c_loss=average_loss(tower_c_losses)
 
+        tf.summary.scalar("critic_loss",total_c_loss)
+
+        # for g in average_grads_g:
+        #     variable_summaries(g[0],g[0].name)
+
+        tf.summary.image('img', generate_img, max_outputs=10)
+        variable_summaries(generate_img,'generated_img')
+
         apply_gradient_c = opt_c.apply_gradients(average_grads_c)
-        apply_gradient_g = opt_c.apply_gradients(average_grads_g)
+        apply_gradient_g = opt_g.apply_gradients(average_grads_g)
 
         theta_c = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='critic')
         clipped_var_c = [tf.assign(var, tf.clip_by_value(var, clamp_lower, clamp_upper)) for var in theta_c]
         # merge the clip operations on critic variables
         with tf.control_dependencies([apply_gradient_c]):
             apply_gradient_c = tf.tuple(clipped_var_c)
+
 
     return apply_gradient_g,apply_gradient_c,total_c_loss
 
@@ -411,7 +437,7 @@ def train_MSR_face_multi_gpu():
     prefix='WGAN_Emotion'
     batch_size=64
     converge_c_iter=100
-    converge_g_iter=25
+    converge_g_iter=10
     revise_c_iter=10
     max_iter_step=200000
 
@@ -420,28 +446,29 @@ def train_MSR_face_multi_gpu():
     config.log_device_placement=True
 
     sess=tf.InteractiveSession()
-    opt_g,opt_c,c_loss=build_train_MSR_face_graph_multi_gpu(batch_size=batch_size,latent_dims=1024,
-                                                          lr_g=5e-5,lr_c=5e-5,
+    opt_g,opt_c,c_loss=build_train_MSR_face_graph_multi_gpu(batch_size=batch_size,latent_dims=2048,
+                                                          lr_g=5e-3,lr_c=5e-4,
                                                           clamp_lower=-0.01,clamp_upper=0.01)
 
     # print([x.name for x in tf.global_variables()])
     merged_all = tf.summary.merge_all()
     saver = tf.train.Saver()
-    summary_writer = tf.summary.FileWriter('log/'+prefix+'/')
 
     coord = tf.train.Coordinator()
     threads = tf.train.start_queue_runners(coord=coord)
     tf.global_variables_initializer().run()
+    summary_writer = tf.summary.FileWriter('log/'+prefix+'/',sess.graph)
 
 
     fc=open('c_loss.log','w')
     fg=open('g_loss.log','w')
-    log_interval=10
+    log_interval=50
     for i in range(max_iter_step):
         if i < converge_g_iter or i % 500 == 0:
             citers = converge_c_iter
         else:
             citers = revise_c_iter
+            # citers=0
 
         for j in range(citers):
             if i % log_interval == log_interval-1 and j == 0:
@@ -450,7 +477,7 @@ def train_MSR_face_multi_gpu():
                 _, merged,loss_val = sess.run([opt_c, merged_all,c_loss],
                                      options=run_options, run_metadata=run_metadata)
                 summary_writer.add_summary(merged)
-                # summary_writer.add_run_metadata(run_metadata, 'critic_metadata {}'.format(i), i)
+                summary_writer.add_run_metadata(run_metadata, 'critic_metadata {}'.format(i), i)
                 print('loss val {}'.format(loss_val))
                 fc.write('loss val {}\n'.format(loss_val))
             else:
@@ -458,7 +485,9 @@ def train_MSR_face_multi_gpu():
 
         # print('optimize g')
         if i % log_interval == log_interval - 1:
-            _, merged = sess.run([opt_g, merged_all],options=run_options, run_metadata=run_metadata)
+            run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+            run_metadata = tf.RunMetadata()
+            _, merged,loss_val = sess.run([opt_g, merged_all,c_loss],options=run_options, run_metadata=run_metadata)
             summary_writer.add_summary(merged)
             summary_writer.add_run_metadata(run_metadata, 'generator_metadata {}'.format(i), i)
             print('generator optimize loss val {}'.format(loss_val))
