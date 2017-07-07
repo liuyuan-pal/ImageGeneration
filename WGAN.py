@@ -23,42 +23,48 @@ def lrelu(x, leak=0.3, name="lrelu"):
         f2 = 0.5 * (1 - leak)
         return f1 * x + f2 * abs(x)
 
-def generator(z,initial_shape,target_shape,final_activate,init_fn,for_train=True):
+def generator(z,initial_shape,target_shape,final_activate,
+              init_fn=tf.random_normal_initializer(stddev=0.02),kernel_size=5,for_train=True):
     h=L.fully_connected(z,initial_shape[0]*initial_shape[1]*initial_shape[2],
                         activation_fn=tf.nn.relu,
                         normalizer_fn=L.batch_norm,
-                         normalizer_params={'is_training': for_train},
-                         weights_initializer=init_fn)
+                        normalizer_params={'is_training': for_train,
+                                            'center':True,
+                                            'scale':True},
+                        weights_initializer=init_fn)
 
     h=tf.reshape(h,[-1,initial_shape[0],initial_shape[1],initial_shape[2]])
     k=math.log(target_shape[0]/initial_shape[0],2)
     next_channel=int(initial_shape[2]/2)
     for i in range(int(k)):
         h=L.conv2d_transpose(inputs=h,num_outputs=int(next_channel),
-                             kernel_size=3,stride=2,padding='same',
+                             kernel_size=kernel_size,stride=2,padding='same',
                              activation_fn=tf.nn.relu,
                              normalizer_fn=L.batch_norm,
-                             normalizer_params={'is_training': for_train},
+                             normalizer_params={'is_training': for_train,
+                                                'center':True,
+                                                'scale':True},
+                             # use_bias=True,
                              weights_initializer=init_fn)
         next_channel/=2
 
     out=L.conv2d_transpose(h,num_outputs=target_shape[2],
-                           kernel_size=3,stride=1,
+                           kernel_size=kernel_size,stride=1,
                            activation_fn=final_activate,
                            weights_initializer=init_fn)
     return out
 
-def critic(img,init_channel,conv_layers,init_fn,reuse=False):
+def critic(img,init_channel,conv_layers,init_fn,kernel_size=5,reuse=False):
     with tf.variable_scope('critic') as scope:
         if reuse:
             scope.reuse_variables()
 
         for _ in range(conv_layers):
             img = L.conv2d(img, num_outputs=init_channel,
-                           kernel_size=3,stride=2,
-                           activation_fn=tf.nn.relu,
-                           normalizer_fn=L.batch_norm,
-                           normalizer_params={'is_training': True},
+                           kernel_size=kernel_size,stride=2,
+                           activation_fn=lrelu,
+                           # normalizer_fn=L.batch_norm,
+                           # normalizer_params={'is_training': True},
                            weights_initializer=init_fn)
 
             init_channel*=2
@@ -365,13 +371,18 @@ def build_train_MSR_face_graph_multi_gpu(
     lr_g=1e-4,
     lr_c=5e-5,
     clamp_lower=-0.01,
-    clamp_upper=0.01
+    clamp_upper=0.01,
+    use_gradient_penalty=True,
+    stddev=0.02,
+    norm_val=10
 ):
-    from data_utils import get_msr_train_faces
+    from data_utils import get_cartoon_faces
     with tf.device('/cpu:0'):
+        phase=tf.placeholder(tf.bool)
+
         opt_g = tf.train.RMSPropOptimizer(lr_g)
         opt_c = tf.train.RMSPropOptimizer(lr_c)
-        real_img , _ = get_msr_train_faces(batch_size,'data/msr_train_happy.tfrecords')
+        real_img = get_cartoon_faces(batch_size)
         batch_queue = tf.contrib.slim.prefetch_queue.prefetch_queue([real_img], capacity=2 * num_gpus)
 
         tower_grads_c = []
@@ -382,17 +393,20 @@ def build_train_MSR_face_graph_multi_gpu(
                 image_batch = batch_queue.dequeue()
                 with tf.device('/gpu:%d' % i):
                     with tf.name_scope('%s_%d' % ('tower', i)):
-                        z=tf.random_normal([batch_size,latent_dims])
+                        z=tf.random_uniform([batch_size,latent_dims],-1,1)
 
                         with tf.variable_scope('generator'):
-                            generate_img = generator(z, [4, 4, 128], [64, 64, 3], tf.tanh,
-                                                     L.xavier_initializer(uniform=False))
+                            generate_img = generator(z, [4, 4, 1024], [64, 64, 3], tf.tanh,
+                                                     tf.random_normal_initializer(stddev=stddev),
+                                                     kernel_size=5,for_train=phase)
+
                             tf.get_variable_scope().reuse_variables()
 
 
-                        fake_logit = critic(generate_img, 32, 4, L.xavier_initializer(uniform=False),
-                                            (True if i>=1 else False))
-                        true_logit = critic(image_batch, 32, 4, L.xavier_initializer(uniform=False), True)
+                        fake_logit = critic(generate_img, 64, 4, tf.truncated_normal_initializer(stddev=stddev),
+                                            kernel_size=5,reuse=(True if i>=1 else False))
+                        true_logit = critic(image_batch, 64, 4, tf.truncated_normal_initializer(stddev=stddev),
+                                            kernel_size=5,reuse=True)
 
                         tf.get_variable_scope().reuse_variables()
 
@@ -401,6 +415,16 @@ def build_train_MSR_face_graph_multi_gpu(
 
                         c_loss = tf.reduce_mean(fake_logit - true_logit,name='c_loss')
                         g_loss = tf.reduce_mean(-fake_logit,name='g_loss')
+
+                        if use_gradient_penalty:
+                            alpha = tf.random_uniform(shape=[batch_size, 1, 1, 1],minval=0., maxval=1.)
+                            x_hat=generate_img*alpha+(1.0-alpha)*image_batch
+                            d_hat=critic(x_hat,64, 4, tf.truncated_normal_initializer(stddev=stddev), 5, True)
+                            gradients=tf.gradients(d_hat, [x_hat])[0]
+                            print(gradients)
+                            ddx=tf.sqrt(tf.reduce_sum(tf.square(gradients),axis=[1,2,3]))
+                            ddx=tf.reduce_mean(tf.square(ddx-tf.constant(1,tf.float32)))*tf.constant(norm_val,tf.float32)
+                            c_loss=c_loss+ddx
 
                         tower_c_losses.append(c_loss)
 
@@ -421,50 +445,53 @@ def build_train_MSR_face_graph_multi_gpu(
         variable_summaries(generate_img,'generated_img')
 
         apply_gradient_c = opt_c.apply_gradients(average_grads_c)
-        apply_gradient_g = opt_g.apply_gradients(average_grads_g)
 
-        theta_c = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='critic')
-        clipped_var_c = [tf.assign(var, tf.clip_by_value(var, clamp_lower, clamp_upper)) for var in theta_c]
-        # merge the clip operations on critic variables
-        with tf.control_dependencies([apply_gradient_c]):
-            apply_gradient_c = tf.tuple(clipped_var_c)
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        # add dependency of updating moving statistics of batch normalization
+        with tf.control_dependencies(update_ops):
+            apply_gradient_g = opt_g.apply_gradients(average_grads_g)
 
+        if not use_gradient_penalty:
+            theta_c = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='critic')
+            clipped_var_c = [tf.assign(var, tf.clip_by_value(var, clamp_lower, clamp_upper)) for var in theta_c]
+            # merge the clip operations on critic variables
+            with tf.control_dependencies([apply_gradient_c]):
+                apply_gradient_c = tf.tuple(clipped_var_c)
 
-    return apply_gradient_g,apply_gradient_c,total_c_loss
+    return apply_gradient_g,apply_gradient_c,total_c_loss,phase
 
 def train_MSR_face_multi_gpu():
-
-    prefix='WGAN_Emotion'
+    prefix='WGAN_Cartoon_V2'
     batch_size=64
-    converge_c_iter=100
-    converge_g_iter=10
-    revise_c_iter=10
+    converge_c_iter=300
+    converge_g_iter=25
+    revise_c_iter=30
     max_iter_step=200000
+    restore_epoch=9099
 
     config = tf.ConfigProto()
     config.gpu_options.allow_growth = True
     config.log_device_placement=True
 
     sess=tf.InteractiveSession()
-    opt_g,opt_c,c_loss=build_train_MSR_face_graph_multi_gpu(batch_size=batch_size,latent_dims=2048,
-                                                          lr_g=5e-3,lr_c=5e-4,
-                                                          clamp_lower=-0.01,clamp_upper=0.01)
+    opt_g,opt_c,c_loss,phase=build_train_MSR_face_graph_multi_gpu(batch_size=batch_size,latent_dims=256)
 
-    # print([x.name for x in tf.global_variables()])
+    print([x.name for x in tf.global_variables()])
     merged_all = tf.summary.merge_all()
     saver = tf.train.Saver()
 
     coord = tf.train.Coordinator()
     threads = tf.train.start_queue_runners(coord=coord)
-    tf.global_variables_initializer().run()
+    # tf.global_variables_initializer().run()
+    saver.restore(sess,"model/"+prefix+"/model.ckpt-{}".format(restore_epoch))
     summary_writer = tf.summary.FileWriter('log/'+prefix+'/',sess.graph)
-
 
     fc=open('c_loss.log','w')
     fg=open('g_loss.log','w')
-    log_interval=50
-    for i in range(max_iter_step):
-        if i < converge_g_iter or i % 500 == 0:
+    log_interval=10
+    save_interval=100
+    for i in range(restore_epoch+1,max_iter_step):
+        if i < converge_g_iter or i % 20 == 0:
             citers = converge_c_iter
         else:
             citers = revise_c_iter
@@ -475,36 +502,68 @@ def train_MSR_face_multi_gpu():
                 run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
                 run_metadata = tf.RunMetadata()
                 _, merged,loss_val = sess.run([opt_c, merged_all,c_loss],
-                                     options=run_options, run_metadata=run_metadata)
+                                               feed_dict={phase:1},
+                                               options=run_options, run_metadata=run_metadata)
                 summary_writer.add_summary(merged)
                 summary_writer.add_run_metadata(run_metadata, 'critic_metadata {}'.format(i), i)
                 print('loss val {}'.format(loss_val))
                 fc.write('loss val {}\n'.format(loss_val))
             else:
-                sess.run(opt_c)
+                sess.run(opt_c,feed_dict={phase:1})
 
         # print('optimize g')
         if i % log_interval == log_interval - 1:
             run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
             run_metadata = tf.RunMetadata()
-            _, merged,loss_val = sess.run([opt_g, merged_all,c_loss],options=run_options, run_metadata=run_metadata)
+            _, merged,loss_val = sess.run([opt_g, merged_all,c_loss],
+                                          feed_dict={phase:1},
+                                          options=run_options, run_metadata=run_metadata)
             summary_writer.add_summary(merged)
             summary_writer.add_run_metadata(run_metadata, 'generator_metadata {}'.format(i), i)
             print('generator optimize loss val {}'.format(loss_val))
             fg.write('loss val {}\n'.format(loss_val))
         else:
-            sess.run(opt_g)
+            sess.run(opt_g,feed_dict={phase:1})
 
-        if i % 1000 == 999:
+        if i % save_interval == save_interval-1:
             saver.save(sess, 'model/'+prefix+'/model.ckpt', global_step=i)
 
     coord.request_stop()
     coord.join(threads)
     sess.close()
 
-if __name__=="__main__":
-    train_MSR_face_multi_gpu()
+def generate_img(restore_name,
+                 restore_epoch,
+                 sample_num,
+                 latent_dims,
+                 stddev=0.02):
+    z=tf.placeholder(tf.float32,[sample_num+1, latent_dims])
+    with tf.variable_scope('generator'):
+        gan = generator(z, [4, 4, 1024], [64, 64, 3], tf.tanh,
+                      tf.random_normal_initializer(stddev=stddev),5,False)
 
+    with tf.Session() as sess:
+        saver = tf.train.Saver()
+        saver.restore(sess, "./model/"+restore_name+"/model.ckpt-{}".format(restore_epoch))
+
+        batch_z = np.random.normal(0, 1.0, [2, latent_dims]).astype(np.float32)
+        int_z = (np.arange(sample_num+1,dtype=np.float32)/sample_num)[:,None]*batch_z[0][None,:]+\
+            (1.0-np.arange(sample_num+1, dtype=np.float32) / sample_num)[:, None] * batch_z[1][None, :]
+        rs = gan.eval(feed_dict={z: int_z})
+
+        for i in range(sample_num+1):
+            # b=(rs[i,:,:,0]-np.min(rs[i,:,:,0]))/(np.max(rs[i,:,:,0])-np.min(rs[i,:,:,0]))*255
+            # g=(rs[i,:,:,1]-np.min(rs[i,:,:,1]))/(np.max(rs[i,:,:,1])-np.min(rs[i,:,:,1]))*255
+            # r=(rs[i,:,:,2]-np.min(rs[i,:,:,2]))/(np.max(rs[i,:,:,2])-np.min(rs[i,:,:,2]))*255
+            # img=np.stack([b,g,r],axis=2)
+            img=(rs[i]+1.0)/2.0*255
+            # print(img.shape)
+            # print(np.max(rs[i]),np.min(rs[i]))
+            cv2.imwrite('result/int/'+restore_name+'/{}.jpg'.format(i),np.asarray(img,dtype=np.uint8))
+
+if __name__=="__main__":
+    # generate_img('WGAN_Cartoon',17199,20,1024)
+    train_MSR_face_multi_gpu()
 
 
 
