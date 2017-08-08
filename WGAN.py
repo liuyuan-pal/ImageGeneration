@@ -430,6 +430,8 @@ def build_train_MSR_face_graph_multi_gpu(
 
                         tower_grads_c.append(opt_c.compute_gradients(c_loss,var_list=theta_c))
                         tower_grads_g.append(opt_g.compute_gradients(g_loss,var_list=theta_g))
+                        print(tower_grads_c[-1])
+                        exit(0)
 
         average_grads_c=average_gradients(tower_grads_c)
         average_grads_g=average_gradients(tower_grads_g)
@@ -537,7 +539,7 @@ def generate_img(restore_name,
                  sample_num,
                  latent_dims,
                  stddev=0.02):
-    z=tf.placeholder(tf.float32,[sample_num+1, latent_dims])
+    z=tf.placeholder(tf.float32,[sample_num, latent_dims])
     with tf.variable_scope('generator'):
         gan = generator(z, [4, 4, 1024], [64, 64, 3], tf.tanh,
                       tf.random_normal_initializer(stddev=stddev),5,False)
@@ -546,12 +548,12 @@ def generate_img(restore_name,
         saver = tf.train.Saver()
         saver.restore(sess, "./model/"+restore_name+"/model.ckpt-{}".format(restore_epoch))
 
-        batch_z = np.random.normal(0, 1.0, [2, latent_dims]).astype(np.float32)
-        int_z = (np.arange(sample_num+1,dtype=np.float32)/sample_num)[:,None]*batch_z[0][None,:]+\
-            (1.0-np.arange(sample_num+1, dtype=np.float32) / sample_num)[:, None] * batch_z[1][None, :]
-        rs = gan.eval(feed_dict={z: int_z})
+        batch_z = np.random.uniform(-1.0, 1.0, [sample_num,latent_dims]).astype(np.float32)
+        # int_z = (np.arange(sample_num+1,dtype=np.float32)/sample_num)[:,None]*batch_z[0][None,:]+\
+        #     (1.0-np.arange(sample_num+1, dtype=np.float32) / sample_num)[:, None] * batch_z[1][None, :]
+        rs = gan.eval(feed_dict={z: batch_z})
 
-        for i in range(sample_num+1):
+        for i in range(sample_num):
             # b=(rs[i,:,:,0]-np.min(rs[i,:,:,0]))/(np.max(rs[i,:,:,0])-np.min(rs[i,:,:,0]))*255
             # g=(rs[i,:,:,1]-np.min(rs[i,:,:,1]))/(np.max(rs[i,:,:,1])-np.min(rs[i,:,:,1]))*255
             # r=(rs[i,:,:,2]-np.min(rs[i,:,:,2]))/(np.max(rs[i,:,:,2])-np.min(rs[i,:,:,2]))*255
@@ -562,7 +564,7 @@ def generate_img(restore_name,
             cv2.imwrite('result/int/'+restore_name+'/{}.jpg'.format(i),np.asarray(img,dtype=np.uint8))
 
 if __name__=="__main__":
-    # generate_img('WGAN_Cartoon',17199,20,1024)
+    # generate_img('WGAN_Cartoon_V2',12399,200,256)
     train_MSR_face_multi_gpu()
 
 

@@ -105,4 +105,4 @@ def generate_cartoon_face(num=50000):
 
     writer.close()
 if __name__=="__main__":
-    convert_cartoon_face((96,96),'data/user_face.tfrecords')
+    convert_cartoon_face((128,128),'data/user_face.tfrecords')
